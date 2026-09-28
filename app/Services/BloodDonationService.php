@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Mail\EmergencyBloodRequestMail;
 use App\Models\BloodDonation;
+use App\Models\BloodDonationCooldown;
 use App\Models\BloodRequest;
 use App\Models\Hospital;
 use App\Models\Patient;
@@ -12,78 +13,138 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Mail;
 
 /**
- * Blood donation eligibility (every 3 months) and the hospital-side
- * emergency call for a specific blood type — both live here because
- * "who's eligible to donate right now" is the one piece of logic both
- * sides actually care about (a patient checking their own status, and a
- * hospital's emergency email needing to filter exactly the same way).
+ * Blood donation: a patient logs a donation, the hospital confirms it, and
+ * confirmation is what starts the clock and pays the reward points.
+ *
+ * Everything hangs off confirmed_at rather than the date the patient typed,
+ * so the countdown a patient sees, the eligibility check, and the hospital's
+ * emergency donor email all agree — and a donation nobody confirms neither
+ * earns points nor blocks the donor.
  */
 class BloodDonationService
 {
-    private const COOLDOWN_MONTHS = 3;
+    public function __construct(private RewardPointService $rewards, private NotificationService $notifications)
+    {
+    }
+
+    /** The patient's most recent CONFIRMED donation — what the cooldown is measured from. */
+    public function latestConfirmed(Patient $patient): ?BloodDonation
+    {
+        return $patient->bloodDonations()
+            ->where('status', 'confirmed')
+            ->orderByDesc('confirmed_at')
+            ->first();
+    }
+
+    /** A donation already logged and still waiting on the hospital blocks logging another. */
+    public function pendingDonation(Patient $patient): ?BloodDonation
+    {
+        return $patient->bloodDonations()->where('status', 'pending')->orderByDesc('donation_id')->first();
+    }
 
     /** Is this patient allowed to log a donation RIGHT NOW? */
     public function isEligible(Patient $patient): bool
     {
-        if (!$patient->last_donated_at) {
-            return true; // never donated before — always eligible
-        }
+        $nextEligible = $this->nextEligibleDate($patient);
 
-        return $patient->last_donated_at->lte(now()->subMonths(self::COOLDOWN_MONTHS));
+        return $nextEligible === null || $nextEligible->isPast();
     }
 
-    /** When this patient next becomes eligible — null if they're eligible already (or have never donated). */
+    /** The exact moment the countdown ends — null when they can donate already. */
     public function nextEligibleDate(Patient $patient): ?Carbon
     {
-        if ($this->isEligible($patient)) {
-            return null;
-        }
+        $endsAt = $this->latestConfirmed($patient)?->cooldownEndsAt();
 
-        return $patient->last_donated_at->copy()->addMonths(self::COOLDOWN_MONTHS);
+        return $endsAt && $endsAt->isFuture() ? $endsAt : null;
     }
 
     /**
-     * Logs a donation — re-checks eligibility server-side (the "Log a
-     * donation" form is hidden/disabled in the UI when ineligible, but
-     * that's never trusted as the real enforcement). Takes the MAX of
-     * every donation on file (not just blindly the new date) as the
-     * refreshed last_donated_at, in case a patient ever logs one out of
-     * chronological order.
+     * Logs a donation as PENDING. It counts for nothing until the hospital
+     * confirms it — see confirm(). Re-checks eligibility server-side; the
+     * form is hidden when ineligible, but that is never the real enforcement.
      */
     public function recordDonation(Patient $patient, string $donatedAt, ?Hospital $hospital): array
     {
+        if ($pending = $this->pendingDonation($patient)) {
+            return ['ok' => false, 'message' => 'You already logged a donation on ' . $pending->donated_at->format('M j, Y') . ' that is waiting for the hospital to confirm.'];
+        }
+
         if (!$this->isEligible($patient)) {
-            return ['ok' => false, 'message' => 'You can donate again on ' . $this->nextEligibleDate($patient)->format('M j, Y') . '.'];
+            return ['ok' => false, 'message' => 'You can donate again on ' . $this->nextEligibleDate($patient)->format('M j, Y g:i A') . '.'];
         }
 
         if (Carbon::parse($donatedAt)->isFuture()) {
-            return ['ok' => false, 'message' => 'The donation date can\'t be in the future.'];
+            return ['ok' => false, 'message' => "The donation date can't be in the future."];
         }
 
         BloodDonation::create([
             'patient_id' => $patient->patient_id,
             'hospital_id' => $hospital?->hospital_id,
             'donated_at' => $donatedAt,
+            'status' => 'pending',
         ]);
 
-        $latest = $patient->bloodDonations()->max('donated_at');
-        $patient->update(['last_donated_at' => $latest]);
-
-        return ['ok' => true, 'message' => 'Thank you for donating! Logged for ' . Carbon::parse($donatedAt)->format('M j, Y') . '.'];
+        return ['ok' => true, 'message' => 'Logged — waiting for ' . ($hospital?->hospital_name ?? 'the hospital') . ' to confirm it. Your reward points and countdown start once they do.'];
     }
 
     /**
-     * Every patient who (a) has this exact blood group, (b) is eligible to
-     * donate right now (see isEligible()), and (c) has a real, active
-     * account to actually receive the email.
+     * Hospital confirms the donation really happened: the countdown starts
+     * now, and the donor is credited their reward points (award() is keyed on
+     * the donation id, so confirming twice cannot pay twice).
+     */
+    public function confirm(BloodDonation $donation, Hospital $hospital): array
+    {
+        if ($donation->hospital_id !== $hospital->hospital_id) {
+            return ['ok' => false, 'message' => 'That donation was logged for a different hospital.'];
+        }
+
+        if (!$donation->isPending()) {
+            return ['ok' => false, 'message' => 'That donation has already been reviewed.'];
+        }
+
+        $donation->update(['status' => 'confirmed', 'confirmed_at' => now()]);
+
+        $patient = $donation->patient;
+        // Kept in step so the donor email filter and anything else reading
+        // the cached column agree with the confirmed history.
+        $patient->update(['last_donated_at' => $donation->donated_at]);
+
+        $this->rewards->award($patient, 'blood_donation', $donation->donation_id);
+
+        return [
+            'ok' => true,
+            'points' => $this->rewards->pointsFor('blood_donation'),
+            'message' => 'Confirmed — ' . $patient->full_name . ' earned ' . $this->rewards->pointsFor('blood_donation') . ' reward points.',
+        ];
+    }
+
+    /** Hospital says it did not happen: no points, no countdown, donor stays eligible. */
+    public function reject(BloodDonation $donation, Hospital $hospital, ?string $reason = null): array
+    {
+        if ($donation->hospital_id !== $hospital->hospital_id) {
+            return ['ok' => false, 'message' => 'That donation was logged for a different hospital.'];
+        }
+
+        if (!$donation->isPending()) {
+            return ['ok' => false, 'message' => 'That donation has already been reviewed.'];
+        }
+
+        $donation->update(['status' => 'rejected', 'reject_reason' => $reason]);
+
+        return ['ok' => true, 'message' => 'Marked as not confirmed — the donor can log a donation again.'];
+    }
+
+    /**
+     * Every patient who (a) has this exact blood group, (b) is not inside the
+     * cooldown from a confirmed donation, and (c) has a real, active account
+     * to actually receive the email.
      */
     public function eligibleDonors(string $bloodGroup): Collection
     {
         return Patient::where('blood_group', $bloodGroup)
-            ->where(function ($q) {
-                $q->whereNull('last_donated_at')
-                    ->orWhere('last_donated_at', '<=', now()->subMonths(self::COOLDOWN_MONTHS)->toDateString());
-            })
+            ->whereDoesntHave('bloodDonations', fn ($q) => $q
+                ->where('status', 'confirmed')
+                ->where('confirmed_at', '>', now()->subDays(BloodDonationCooldown::DAYS)))
             ->whereHas('account', fn ($q) => $q->where('is_active', true)->where('is_verified', true))
             ->with('account')
             ->get();
@@ -93,11 +154,23 @@ class BloodDonationService
      * Hospital sends an emergency call for one blood type. Emails every
      * currently-eligible donor of that type individually — if one send
      * fails (bad SMTP, etc.) it's logged and skipped rather than aborting
-     * the whole batch, same resilience idea as OtpService::issue().
+     * the whole batch, same resilience idea as OtpService::issue() — and
+     * also gives each of them an in-app notification (NotificationService),
+     * since an email alone is easy to miss for something this time-
+     * sensitive. The notification always fires even if that donor's email
+     * happened to fail, so a bad email address never means a donor hears
+     * nothing at all.
      */
     public function sendEmergencyRequest(Hospital $hospital, string $bloodGroup, ?string $message): array
     {
         $donors = $this->eligibleDonors($bloodGroup);
+
+        $bloodRequest = BloodRequest::create([
+            'hospital_id' => $hospital->hospital_id,
+            'blood_group' => $bloodGroup,
+            'message' => $message,
+            'recipient_count' => $donors->count(),
+        ]);
 
         $sent = 0;
         foreach ($donors as $patient) {
@@ -112,14 +185,14 @@ class BloodDonationService
             } catch (\Throwable $e) {
                 report($e);
             }
-        }
 
-        $bloodRequest = BloodRequest::create([
-            'hospital_id' => $hospital->hospital_id,
-            'blood_group' => $bloodGroup,
-            'message' => $message,
-            'recipient_count' => $sent,
-        ]);
+            $this->notifications->notify(
+                $patient->account,
+                'blood_request',
+                "Urgent: {$hospital->hospital_name} needs {$bloodGroup} blood donors" . ($message ? " — {$message}" : '.'),
+                $bloodRequest->blood_request_id
+            );
+        }
 
         return ['ok' => true, 'sent' => $sent, 'total' => $donors->count(), 'bloodRequest' => $bloodRequest];
     }

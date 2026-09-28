@@ -55,6 +55,9 @@ class RewardPointService
             'review' => 'POINTS_PER_REVIEW',
             'medicine_purchase' => 'POINTS_PER_MEDICINE_PURCHASE',
             'lab_test_purchase' => 'POINTS_PER_LAB_TEST_PURCHASE',
+            // Credited when a hospital confirms a donation — see
+            // BloodDonationService::confirm(). Seeded at 10 by its migration.
+            'blood_donation' => 'POINTS_PER_BLOOD_DONATION',
             default => null,
         };
 
