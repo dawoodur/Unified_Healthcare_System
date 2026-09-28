@@ -20,7 +20,10 @@ class Pharmacy extends Model
     public $timestamps = false;           // no created_at/updated_at columns on this table
     protected $primaryKey = 'pharmacy_id'; // our ID column's real name
 
-    protected $fillable = ['account_id', 'pharmacy_name', 'etin_number', 'address'];
+    // latitude/longitude are the pharmacy's position on the map — the starting
+    // point of a delivery, used by the live tracking page. See
+    // database/migrations/..._add_coordinates_for_delivery_tracking.php.
+    protected $fillable = ['account_id', 'pharmacy_name', 'etin_number', 'address', 'latitude', 'longitude'];
 
     /** $pharmacy->account gives back the linked Account (email, password, etc). */
     public function account(): BelongsTo

@@ -18,7 +18,19 @@ class MedicineMaster extends Model
     protected $table = 'medicine_master';
     protected $primaryKey = 'medicine_master_id';
 
-    protected $fillable = ['generic_name', 'brand_name', 'form', 'strength'];
+    protected $fillable = [
+        'generic_name', 'brand_name', 'form', 'strength',
+        'uses_en', 'uses_bn', 'cautions_en', 'cautions_bn', 'is_prescription_only', 'aliases',
+    ];
+
+    // The caution lists are stored as JSON so the health chat can render them
+    // as bullet points — see HealthAssistantAiService::mapPayload().
+    protected $casts = [
+        'cautions_en' => 'array',
+        'cautions_bn' => 'array',
+        'aliases' => 'array',
+        'is_prescription_only' => 'boolean',
+    ];
 
     /** $medicine->stock gives back every pharmacy's batches of this medicine. */
     public function stock(): HasMany
